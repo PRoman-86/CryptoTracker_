@@ -5,167 +5,336 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.abs
 
 // --- 1. МОДЕЛИ ДАННЫХ ---
+@Suppress("SpellCheckingInspection")
 enum class CryptoToken(
-    val title: String, val symbol: String, val cgId: String,
-    val iconStr: String, val color: Color
+    val title: String,
+    val symbol: String,
+    val cgId: String,
+    val iconStr: String,
+    val color: Color
 ) {
-    SOL("Solana", "SOLUSDT", "solana", "◎", Color(0xFF9C27B0)),
-    BTC("Bitcoin", "BTCUSDT", "bitcoin", "₿", Color(0xFFFF9800)),
-    ETH("Ethereum", "ETHUSDT", "ethereum", "◆", Color(0xFF2196F3))
+    SOL("Solana", "SOLUSDT", "solana", "◎", Color(0xFFAB47BC)),
+    BTC("Bitcoin", "BTCUSDT", "bitcoin", "₿", Color(0xFFFFA726)),
+    ETH("Ethereum", "ETHUSDT", "ethereum", "◆", Color(0xFF42A5F5))
 }
 
 data class DailyPrice(
     val date: String,
-    val rawOpen: Double, val rawHigh: Double,
-    val rawLow: Double, val rawClose: Double,
-    val highPriceString: String
+    val rawOpen: Double,
+    val rawHigh: Double,
+    val rawLow: Double,
+    val rawClose: Double,
+    val highPriceString: String,
+    val isToday: Boolean = false
 ) {
     val isBullish: Boolean get() = rawClose >= rawOpen
 }
 
-// --- 2. VIEWMODEL (Логика и Сеть) ---
-class CryptoViewModel : ViewModel() {
-    private val _selectedCrypto = MutableStateFlow(CryptoToken.SOL)
-    val selectedCrypto: StateFlow<CryptoToken> = _selectedCrypto.asStateFlow()
+data class MarketCapInfo(
+    val marketCap: Double,
+    val change24h: Double
+)
 
-    private val _priceText = MutableStateFlow("—")
-    val priceText = _priceText.asStateFlow()
+data class FearAndGreedInfo(
+    val value: String,
+    val classification: String
+)
 
-    private val _history = MutableStateFlow<List<DailyPrice>>(emptyList())
-    val history = _history.asStateFlow()
+data class TokenData(
+    val currentPrice: Double? = null,
+    val priceText: String = "—",
+    val history: List<DailyPrice> = emptyList(),
+    val marketCap: Double? = null,
+    val marketCapChange: Double = 0.0,
+    val lastUpdatedText: String? = null
+) {
+    // Синхронизируем текущую (сегодняшнюю) свечу с живой ценой тикера
+    val effectiveHistory: List<DailyPrice>
+        get() {
+            val price = currentPrice ?: return history
+            return history.map { day ->
+                if (day.isToday) {
+                    val syncedHigh = maxOf(day.rawHigh, price)
+                    val syncedLow = minOf(day.rawLow, price)
+                    day.copy(
+                        rawHigh = syncedHigh,
+                        rawLow = syncedLow,
+                        rawClose = price,
+                        highPriceString = formatPrice(syncedHigh)
+                    )
+                } else {
+                    day
+                }
+            }
+        }
 
-    private val _isLoading = MutableStateFlow(false)
-    val isLoading = _isLoading.asStateFlow()
+    val periodMaxPrice: Double?
+        get() = listOfNotNull(
+            effectiveHistory.maxOfOrNull { it.rawHigh },
+            currentPrice
+        ).maxOrNull()
 
-    private val _fearAndGreedValue = MutableStateFlow("—")
-    val fearAndGreedValue = _fearAndGreedValue.asStateFlow()
+    val periodMinPrice: Double?
+        get() = listOfNotNull(
+            effectiveHistory.minOfOrNull { it.rawLow },
+            currentPrice
+        ).minOrNull()
+}
 
-    private val _fearAndGreedClass = MutableStateFlow("")
-    val fearAndGreedClass = _fearAndGreedClass.asStateFlow()
+data class CryptoUiState(
+    val selectedCrypto: CryptoToken = CryptoToken.SOL,
+    val isLoading: Boolean = false,
+    val tokenDataMap: Map<CryptoToken, TokenData> = emptyMap(),
+    val fearAndGreedValue: String = "—",
+    val fearAndGreedClass: String = ""
+) {
+    val currentTokenData: TokenData
+        get() = tokenDataMap[selectedCrypto] ?: TokenData()
+}
 
-    private val _marketCap = MutableStateFlow<Double?>(null)
-    val marketCap = _marketCap.asStateFlow()
+// --- 2. СЕТЕВОЙ СЛОЙ (REPOSITORY) ---
+class CryptoRepository {
 
-    private val _marketCapChange = MutableStateFlow(0.0)
-    val marketCapChange = _marketCapChange.asStateFlow()
+    private fun httpGet(urlString: String): String {
+        val connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "CryptoTrackerAndroid/1.0")
+        }
 
-    init { loadAllData() }
+        return try {
+            val code = connection.responseCode
+            if (code !in 200..299) {
+                throw IOException("HTTP error: $code for $urlString")
+            }
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun fetchCurrentPrice(token: CryptoToken): Result<Double> = runCatching {
+        val response = httpGet("https://api.binance.com/api/v3/ticker/price?symbol=${token.symbol}")
+        JSONObject(response).getString("price").toDouble()
+    }
+
+    fun fetchHistory(token: CryptoToken): Result<List<DailyPrice>> = runCatching {
+        val response = httpGet("https://api.binance.com/api/v3/klines?symbol=${token.symbol}&interval=1d&limit=7")
+        val jsonArray = JSONArray(response)
+        if (jsonArray.length() == 0) return@runCatching emptyList()
+
+        val newHistory = mutableListOf<DailyPrice>()
+        val sdf = SimpleDateFormat("dd.MM", Locale.getDefault())
+        val lastIndex = jsonArray.length() - 1
+
+        for (i in 0..lastIndex) {
+            val dayData = jsonArray.getJSONArray(i)
+            val timestamp = dayData.getLong(0)
+            val open = dayData.getString(1).toDouble()
+            val high = dayData.getString(2).toDouble()
+            val low = dayData.getString(3).toDouble()
+            val close = dayData.getString(4).toDouble()
+            val isToday = (i == lastIndex)
+
+            newHistory.add(
+                DailyPrice(
+                    date = if (isToday) "сегодня" else sdf.format(Date(timestamp)),
+                    rawOpen = open,
+                    rawHigh = high,
+                    rawLow = low,
+                    rawClose = close,
+                    highPriceString = formatPrice(high),
+                    isToday = isToday
+                )
+            )
+        }
+        newHistory
+    }
+
+    fun fetchFearAndGreed(): Result<FearAndGreedInfo> = runCatching {
+        val response = httpGet("https://api.alternative.me/fng/")
+        val firstItem = JSONObject(response).getJSONArray("data").getJSONObject(0)
+        FearAndGreedInfo(
+            value = firstItem.getString("value"),
+            classification = firstItem.getString("value_classification")
+        )
+    }
+
+    fun fetchMarketCap(token: CryptoToken): Result<MarketCapInfo> = runCatching {
+        val id = token.cgId
+        val response = httpGet(
+            "https://api.coingecko.com/api/v3/simple/price?ids=$id&vs_currencies=usd&include_market_cap=true&include_24hr_change=true"
+        )
+        val coinData = JSONObject(response).getJSONObject(id)
+        MarketCapInfo(
+            marketCap = coinData.getDouble("usd_market_cap"),
+            change24h = coinData.getDouble("usd_24h_change")
+        )
+    }
+}
+
+// --- 3. VIEWMODEL ---
+class CryptoViewModel(
+    private val repository: CryptoRepository = CryptoRepository()
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(CryptoUiState())
+    val uiState: StateFlow<CryptoUiState> = _uiState.asStateFlow()
+
+    private var loadJob: Job? = null
+
+    init {
+        loadAllData()
+    }
 
     fun selectCrypto(token: CryptoToken) {
-        if (_selectedCrypto.value != token) {
-            _selectedCrypto.value = token
+        if (_uiState.value.selectedCrypto != token) {
+            _uiState.update { it.copy(selectedCrypto = token) }
             loadAllData()
         }
     }
 
     fun loadAllData() {
-        viewModelScope.launch {
-            _isLoading.value = true
+        val targetToken = _uiState.value.selectedCrypto
+        loadJob?.cancel()
+
+        loadJob = viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+
             try {
-                withContext(Dispatchers.IO) {
-                    fetchCurrentPrice()
-                    fetchHistory()
-                    fetchFearAndGreed()
-                    fetchMarketCap()
+                val (priceRes, historyRes, fngRes, capRes) = withContext(Dispatchers.IO) {
+                    coroutineScope {
+                        val priceDeferred = async { repository.fetchCurrentPrice(targetToken) }
+                        val historyDeferred = async { repository.fetchHistory(targetToken) }
+                        val fngDeferred = async { repository.fetchFearAndGreed() }
+                        val capDeferred = async { repository.fetchMarketCap(targetToken) }
+
+                        FetchBundle(
+                            price = priceDeferred.await(),
+                            history = historyDeferred.await(),
+                            fng = fngDeferred.await(),
+                            marketCap = capDeferred.await()
+                        )
+                    }
+                }
+
+                if (_uiState.value.selectedCrypto != targetToken) return@launch
+
+                val allSucceeded = priceRes.isSuccess &&
+                        historyRes.isSuccess &&
+                        fngRes.isSuccess &&
+                        capRes.isSuccess
+
+                val newTimeStamp = if (allSucceeded) {
+                    val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                    "обновлено в $timeStr"
+                } else {
+                    null
+                }
+
+                _uiState.update { state ->
+                    val prevTokenData = state.tokenDataMap[targetToken] ?: TokenData()
+
+                    val updatedCurrentPrice = priceRes.getOrNull() ?: prevTokenData.currentPrice
+                    val updatedPriceText = priceRes.fold(
+                        onSuccess = { formatPrice(it) },
+                        onFailure = { if (prevTokenData.priceText == "—") "Ошибка" else prevTokenData.priceText }
+                    )
+
+                    val updatedHistory = historyRes.getOrElse { prevTokenData.history }
+
+                    val updatedCap = capRes.getOrNull()?.marketCap ?: prevTokenData.marketCap
+                    val updatedCapChange = capRes.getOrNull()?.change24h ?: prevTokenData.marketCapChange
+
+                    val finalTimestamp = newTimeStamp ?: prevTokenData.lastUpdatedText
+
+                    val updatedTokenData = prevTokenData.copy(
+                        currentPrice = updatedCurrentPrice,
+                        priceText = updatedPriceText,
+                        history = updatedHistory,
+                        marketCap = updatedCap,
+                        marketCapChange = updatedCapChange,
+                        lastUpdatedText = finalTimestamp
+                    )
+
+                    val fngInfo = fngRes.getOrNull()
+
+                    state.copy(
+                        tokenDataMap = state.tokenDataMap + (targetToken to updatedTokenData),
+                        fearAndGreedValue = fngInfo?.value ?: state.fearAndGreedValue,
+                        fearAndGreedClass = fngInfo?.classification ?: state.fearAndGreedClass
+                    )
                 }
             } finally {
-                _isLoading.value = false
+                if (_uiState.value.selectedCrypto == targetToken) {
+                    _uiState.update { it.copy(isLoading = false) }
+                }
             }
         }
     }
 
-    private fun fetchCurrentPrice() {
-        try {
-            val response = URL("https://api.binance.com/api/v3/ticker/price?symbol=${_selectedCrypto.value.symbol}").readText()
-            val price = JSONObject(response).getString("price").toDouble()
-            _priceText.value = formatPrice(price)
-        } catch (_: Exception) {
-            if (_priceText.value == "—") _priceText.value = "Ошибка"
-        }
-    }
-
-    private fun fetchHistory() {
-        try {
-            val response = URL("https://api.binance.com/api/v3/klines?symbol=${_selectedCrypto.value.symbol}&interval=1d&limit=7").readText()
-            val jsonArray = JSONArray(response)
-            val newHistory = mutableListOf<DailyPrice>()
-            val sdf = SimpleDateFormat("dd.MM", Locale.getDefault())
-
-            for (i in 0 until jsonArray.length() - 1) {
-                val dayData = jsonArray.getJSONArray(i)
-                val timestamp = dayData.getLong(0)
-                val open = dayData.getString(1).toDouble()
-                val high = dayData.getString(2).toDouble()
-                val low = dayData.getString(3).toDouble()
-                val close = dayData.getString(4).toDouble()
-
-                newHistory.add(
-                    DailyPrice(
-                        date = sdf.format(Date(timestamp)),
-                        rawOpen = open, rawHigh = high,
-                        rawLow = low, rawClose = close,
-                        highPriceString = formatPrice(high)
-                    )
-                )
-            }
-            _history.value = newHistory
-        } catch (_: Exception) {}
-    }
-
-    private fun fetchFearAndGreed() {
-        try {
-            val response = URL("https://api.alternative.me/fng/").readText()
-            val firstItem = JSONObject(response).getJSONArray("data").getJSONObject(0)
-            _fearAndGreedValue.value = firstItem.getString("value")
-            _fearAndGreedClass.value = firstItem.getString("value_classification")
-        } catch (_: Exception) {}
-    }
-
-    private fun fetchMarketCap() {
-        try {
-            val tokenInfo = _selectedCrypto.value.cgId
-            val response = URL("https://api.coingecko.com/api/v3/simple/price?ids=$tokenInfo&vs_currencies=usd&include_market_cap=true&include_24hr_change=true").readText()
-            val coinData = JSONObject(response).getJSONObject(tokenInfo)
-            _marketCap.value = coinData.getDouble("usd_market_cap")
-            _marketCapChange.value = coinData.getDouble("usd_24h_change")
-        } catch (_: Exception) {}
-    }
+    private data class FetchBundle(
+        val price: Result<Double>,
+        val history: Result<List<DailyPrice>>,
+        val fng: Result<FearAndGreedInfo>,
+        val marketCap: Result<MarketCapInfo>
+    )
 }
 
 // --- ХЕЛПЕРЫ ФОРМАТИРОВАНИЯ ---
@@ -192,26 +361,43 @@ fun translatedFnGClass(fngClass: String): String = when (fngClass) {
 fun fngColor(valueStr: String): Color {
     val valInt = valueStr.toIntOrNull() ?: return Color.Gray
     return when (valInt) {
-        in 0..24 -> Color(0xFFF44336)
-        in 25..44 -> Color(0xFFFF9800)
-        in 45..54 -> Color(0xFFFFEB3B)
-        in 55..74 -> Color(0xFF4CAF50)
-        in 75..100 -> Color(0xFF009688)
+        in 0..24 -> Color(0xFFEF5350)
+        in 25..44 -> Color(0xFFFFA726)
+        in 45..54 -> Color(0xFFFFEE58)
+        in 55..74 -> Color(0xFF66BB6A)
+        in 75..100 -> Color(0xFF26A69A)
         else -> Color.Gray
     }
 }
 
-// --- 3. UI (JETPACK COMPOSE) ---
+// --- 4. UI (JETPACK COMPOSE, PERMANENT DARK THEME) ---
+private val DarkAppColorScheme = darkColorScheme(
+    primary = Color(0xFFAB47BC),
+    background = Color(0xFF121214),
+    surface = Color(0xFF1C1C20),
+    surfaceVariant = Color(0xFF2A2A30),
+    onBackground = Color(0xFFEDEDED),
+    onSurface = Color(0xFFEDEDED),
+    onSurfaceVariant = Color(0xFF9E9EA9)
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Создаем ViewModel напрямую, чтобы не требовать дополнительных библиотек
+        @Suppress("DEPRECATION")
+        window.statusBarColor = 0xFF121214.toInt()
+        @Suppress("DEPRECATION")
+        window.navigationBarColor = 0xFF121214.toInt()
+
         val viewModel = ViewModelProvider(this)[CryptoViewModel::class.java]
 
         setContent {
-            MaterialTheme {
-                Surface(color = MaterialTheme.colorScheme.background) {
+            MaterialTheme(colorScheme = DarkAppColorScheme) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     CryptoScreen(viewModel)
                 }
             }
@@ -220,80 +406,210 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+fun PullToRefreshContainer(
+    isLoading: Boolean,
+    accentColor: Color,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
+) {
+    val density = LocalDensity.current
+    val triggerThresholdPx = with(density) { 80.dp.toPx() }
+    val maxPullPx = with(density) { 120.dp.toPx() }
+    val badgeSizePx = with(density) { 40.dp.toPx() }
+
+    var pullOffset by remember { mutableFloatStateOf(0f) }
+    var isSwipeRefreshing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isLoading) {
+        if (!isLoading) {
+            isSwipeRefreshing = false
+        }
+    }
+
+    val nestedScrollConnection = remember(isLoading, isSwipeRefreshing) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                // Если пользователь уже потянул вниз, а затем повел палец вверх — сначала сворачиваем индикатор
+                if (available.y < 0f && pullOffset > 0f) {
+                    val consumedY = maxOf(available.y, -pullOffset)
+                    pullOffset += consumedY
+                    return Offset(0f, consumedY)
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource
+            ): Offset {
+                // Перехватываем свайп вниз, когда внутренний скролл уже уперся в верхнюю границу
+                if (available.y > 0f && !isLoading && !isSwipeRefreshing) {
+                    val dampedDelta = available.y * 0.5f
+                    pullOffset = (pullOffset + dampedDelta).coerceIn(0f, maxPullPx)
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (pullOffset >= triggerThresholdPx && !isLoading && !isSwipeRefreshing) {
+                    isSwipeRefreshing = true
+                    onRefresh()
+                }
+                pullOffset = 0f
+                return Velocity.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                pullOffset = 0f
+                return Velocity.Zero
+            }
+        }
+    }
+
+    val targetOffset = if (isSwipeRefreshing) triggerThresholdPx * 0.75f else pullOffset
+    val animatedOffset by animateFloatAsState(
+        targetValue = targetOffset,
+        label = "pullRefreshOffset"
+    )
+
+    Box(modifier = modifier.nestedScroll(nestedScrollConnection)) {
+        content()
+
+        if (animatedOffset > 1f || isSwipeRefreshing) {
+            val progress = (pullOffset / triggerThresholdPx).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .graphicsLayer {
+                        translationY = animatedOffset - badgeSizePx
+                    }
+                    .size(40.dp)
+                    .shadow(4.dp, CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
+                    .border(1.dp, accentColor.copy(alpha = 0.6f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isSwipeRefreshing) {
+                    CircularProgressIndicator(
+                        color = accentColor,
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(20.dp)
+                    )
+                } else {
+                    CircularProgressIndicator(
+                        progress = { progress },
+                        color = accentColor,
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun CryptoScreen(viewModel: CryptoViewModel) {
-    val selectedCrypto by viewModel.selectedCrypto.collectAsState()
-    val priceText by viewModel.priceText.collectAsState()
-    val history by viewModel.history.collectAsState()
-    val isLoading by viewModel.isLoading.collectAsState()
+    val uiState by viewModel.uiState.collectAsState()
+    val selectedCrypto = uiState.selectedCrypto
+    val tokenData = uiState.currentTokenData
+    val history = tokenData.effectiveHistory
 
-    val fearAndGreedValue by viewModel.fearAndGreedValue.collectAsState()
-    val fearAndGreedClass by viewModel.fearAndGreedClass.collectAsState()
-    val marketCap by viewModel.marketCap.collectAsState()
-    val marketCapChange by viewModel.marketCapChange.collectAsState()
-
-    val maxHistoryPrice = history.maxOfOrNull { it.rawHigh }
-    val minHistoryPrice = history.minOfOrNull { it.rawLow }
+    val maxPeriodPrice = tokenData.periodMaxPrice
+    val minPeriodPrice = tokenData.periodMinPrice
 
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-    if (isLandscape) {
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(24.dp)
-        ) {
+    PullToRefreshContainer(
+        isLoading = uiState.isLoading,
+        accentColor = selectedCrypto.color,
+        onRefresh = { viewModel.loadAllData() },
+        modifier = Modifier.fillMaxSize()
+    ) {
+        if (isLandscape) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(24.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    CryptoPicker(selectedCrypto) { viewModel.selectCrypto(it) }
+                    Spacer(modifier = Modifier.height(24.dp))
+                    PriceHeader(selectedCrypto, tokenData.priceText)
+                    Spacer(modifier = Modifier.height(24.dp))
+                    UpdateButton(selectedCrypto, uiState.isLoading) { viewModel.loadAllData() }
+                    Spacer(modifier = Modifier.height(24.dp))
+                    HistoryList(history, uiState.isLoading)
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(1.5f)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    StatsPanel(maxPeriodPrice, minPeriodPrice)
+                    Spacer(modifier = Modifier.height(24.dp))
+                    ChartAndExtras(
+                        selectedCrypto = selectedCrypto,
+                        history = history,
+                        currentPrice = tokenData.currentPrice,
+                        maxPeriodPrice = maxPeriodPrice,
+                        minPeriodPrice = minPeriodPrice,
+                        fearAndGreedValue = uiState.fearAndGreedValue,
+                        fearAndGreedClass = uiState.fearAndGreedClass,
+                        marketCap = tokenData.marketCap,
+                        marketCapChange = tokenData.marketCapChange,
+                        lastUpdatedText = tokenData.lastUpdatedText
+                    )
+                }
+            }
+        } else {
             Column(
                 modifier = Modifier
-                    .weight(1f)
-                    .verticalScroll(rememberScrollState()),
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 CryptoPicker(selectedCrypto) { viewModel.selectCrypto(it) }
                 Spacer(modifier = Modifier.height(24.dp))
-                PriceHeader(selectedCrypto, priceText)
+                PriceHeader(selectedCrypto, tokenData.priceText)
                 Spacer(modifier = Modifier.height(24.dp))
-                UpdateButton(selectedCrypto, isLoading) { viewModel.loadAllData() }
-                Spacer(modifier = Modifier.height(24.dp))
-                HistoryList(history, isLoading)
-            }
+                UpdateButton(selectedCrypto, uiState.isLoading) { viewModel.loadAllData() }
 
-            Column(
-                modifier = Modifier
-                    .weight(1.5f)
-                    .verticalScroll(rememberScrollState())
-            ) {
-                StatsPanel(maxHistoryPrice, minHistoryPrice)
                 Spacer(modifier = Modifier.height(24.dp))
-                ChartAndExtras(history, fearAndGreedValue, fearAndGreedClass, marketCap, marketCapChange)
-            }
-        }
-    } else {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            CryptoPicker(selectedCrypto) { viewModel.selectCrypto(it) }
-            Spacer(modifier = Modifier.height(24.dp))
-            PriceHeader(selectedCrypto, priceText)
-            Spacer(modifier = Modifier.height(24.dp))
-            UpdateButton(selectedCrypto, isLoading) { viewModel.loadAllData() }
-
-            Spacer(modifier = Modifier.height(24.dp))
-            HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
-            Spacer(modifier = Modifier.height(24.dp))
-
-            HistoryList(history, isLoading)
-
-            if (history.isNotEmpty()) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
                 Spacer(modifier = Modifier.height(24.dp))
-                StatsPanel(maxHistoryPrice, minHistoryPrice)
-                Spacer(modifier = Modifier.height(24.dp))
-                ChartAndExtras(history, fearAndGreedValue, fearAndGreedClass, marketCap, marketCapChange)
+
+                HistoryList(history, uiState.isLoading)
+
+                if (history.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(24.dp))
+                    StatsPanel(maxPeriodPrice, minPeriodPrice)
+                    Spacer(modifier = Modifier.height(24.dp))
+                    ChartAndExtras(
+                        selectedCrypto = selectedCrypto,
+                        history = history,
+                        currentPrice = tokenData.currentPrice,
+                        maxPeriodPrice = maxPeriodPrice,
+                        minPeriodPrice = minPeriodPrice,
+                        fearAndGreedValue = uiState.fearAndGreedValue,
+                        fearAndGreedClass = uiState.fearAndGreedClass,
+                        marketCap = tokenData.marketCap,
+                        marketCapChange = tokenData.marketCapChange,
+                        lastUpdatedText = tokenData.lastUpdatedText
+                    )
+                }
             }
         }
     }
@@ -304,19 +620,26 @@ fun CryptoPicker(selectedCrypto: CryptoToken, onSelect: (CryptoToken) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
             .padding(4.dp),
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {
-        // Заменили .values() на .entries для совместимости с Kotlin 1.9
         CryptoToken.entries.forEach { token ->
             val isSelected = selectedCrypto == token
-            val bgColor by animateColorAsState(if (isSelected) MaterialTheme.colorScheme.surface else Color.Transparent)
+            var isFocused by remember { mutableStateOf(false) }
+
+            val bgColor by animateColorAsState(
+                targetValue = if (isSelected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent,
+                label = "tabBg"
+            )
+            val borderColor = if (isFocused) token.color else Color.Transparent
 
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .background(bgColor, RoundedCornerShape(6.dp))
+                    .border(1.5.dp, borderColor, RoundedCornerShape(6.dp))
+                    .onFocusChanged { isFocused = it.isFocused }
                     .clickable { onSelect(token) }
                     .padding(vertical = 8.dp),
                 contentAlignment = Alignment.Center
@@ -324,7 +647,11 @@ fun CryptoPicker(selectedCrypto: CryptoToken, onSelect: (CryptoToken) -> Unit) {
                 Text(
                     text = token.title,
                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                    color = if (isSelected) MaterialTheme.colorScheme.onSurface else Color.Gray
+                    color = if (isSelected) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                 )
             }
         }
@@ -334,18 +661,22 @@ fun CryptoPicker(selectedCrypto: CryptoToken, onSelect: (CryptoToken) -> Unit) {
 @Composable
 fun PriceHeader(selectedCrypto: CryptoToken, priceText: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        // Заменили картинки на символы, чтобы убрать зависимость от библиотеки Icons
         Text(
             text = selectedCrypto.iconStr,
             fontSize = 60.sp,
             color = selectedCrypto.color,
             fontWeight = FontWeight.Bold
         )
-        Text("Текущий курс ${selectedCrypto.title}", color = Color.Gray, fontSize = 14.sp)
+        Text(
+            text = "Текущий курс ${selectedCrypto.title}",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 14.sp
+        )
         Text(
             text = "$$priceText",
             fontSize = 36.sp,
             fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier.padding(top = 4.dp)
         )
     }
@@ -353,14 +684,27 @@ fun PriceHeader(selectedCrypto: CryptoToken, priceText: String) {
 
 @Composable
 fun UpdateButton(selectedCrypto: CryptoToken, isLoading: Boolean, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+
     Button(
         onClick = onClick,
         modifier = Modifier
             .fillMaxWidth()
-            .height(48.dp),
+            .height(48.dp)
+            .onFocusChanged { isFocused = it.isFocused }
+            .border(
+                width = if (isFocused) 2.dp else 0.dp,
+                color = if (isFocused) Color.White else Color.Transparent,
+                shape = RoundedCornerShape(12.dp)
+            ),
         enabled = !isLoading,
         shape = RoundedCornerShape(12.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = selectedCrypto.color)
+        colors = ButtonDefaults.buttonColors(
+            containerColor = selectedCrypto.color,
+            contentColor = Color.White,
+            disabledContainerColor = selectedCrypto.color.copy(alpha = 0.5f),
+            disabledContentColor = Color.White.copy(alpha = 0.7f)
+        )
     ) {
         if (isLoading) {
             CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))
@@ -373,23 +717,43 @@ fun UpdateButton(selectedCrypto: CryptoToken, isLoading: Boolean, onClick: () ->
 @Composable
 fun HistoryList(history: List<DailyPrice>, isLoading: Boolean) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Макс. цена за 6 дней", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text(
+            text = "Макс. цена за 7 дней",
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onBackground
+        )
         Spacer(modifier = Modifier.height(12.dp))
 
-        if (history.isEmpty() && !isLoading) {
-            Text("Загрузка истории...", color = Color.Gray)
+        if (history.isEmpty()) {
+            Text(
+                text = if (isLoading) "Загрузка истории..." else "Нет данных",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         } else {
             history.reversed().forEach { item ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
-                        .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp))
                         .padding(16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(item.date, color = Color.Gray)
-                    Text("$${item.highPriceString}", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = item.date,
+                        color = if (item.isToday) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        fontWeight = if (item.isToday) FontWeight.Medium else FontWeight.Normal
+                    )
+                    Text(
+                        text = "$${item.highPriceString}",
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                 }
             }
         }
@@ -397,40 +761,51 @@ fun HistoryList(history: List<DailyPrice>, isLoading: Boolean) {
 }
 
 @Composable
-fun StatsPanel(maxHistoryPrice: Double?, minHistoryPrice: Double?) {
+fun StatsPanel(maxPeriodPrice: Double?, minPeriodPrice: Double?) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Статистика за период", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text(
+            text = "Статистика за период",
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onBackground
+        )
         Spacer(modifier = Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
                     .padding(16.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("▲", color = Color(0xFF4CAF50), fontSize = 14.sp)
+                    Text("▲", color = Color(0xFF66BB6A), fontSize = 14.sp)
                     Spacer(Modifier.width(4.dp))
-                    Text("Максимум", fontSize = 12.sp, color = Color.Gray)
+                    Text("Максимум", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (maxHistoryPrice != null) {
-                    Text("$${formatPrice(maxHistoryPrice)}", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                }
+                Text(
+                    text = maxPeriodPrice?.let { "$${formatPrice(it)}" } ?: "—",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
             }
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
                     .padding(16.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("▼", color = Color(0xFFF44336), fontSize = 14.sp)
+                    Text("▼", color = Color(0xFFEF5350), fontSize = 14.sp)
                     Spacer(Modifier.width(4.dp))
-                    Text("Минимум", fontSize = 12.sp, color = Color.Gray)
+                    Text("Минимум", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (minHistoryPrice != null) {
-                    Text("$${formatPrice(minHistoryPrice)}", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                }
+                Text(
+                    text = minPeriodPrice?.let { "$${formatPrice(it)}" } ?: "—",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
             }
         }
     }
@@ -438,14 +813,24 @@ fun StatsPanel(maxHistoryPrice: Double?, minHistoryPrice: Double?) {
 
 @Composable
 fun ChartAndExtras(
+    selectedCrypto: CryptoToken,
     history: List<DailyPrice>,
+    currentPrice: Double?,
+    maxPeriodPrice: Double?,
+    minPeriodPrice: Double?,
     fearAndGreedValue: String,
     fearAndGreedClass: String,
     marketCap: Double?,
-    marketCapChange: Double
+    marketCapChange: Double,
+    lastUpdatedText: String?
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Дополнительно", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text(
+            text = "Дополнительно",
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onBackground
+        )
         Spacer(modifier = Modifier.height(12.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -455,90 +840,190 @@ fun ChartAndExtras(
                 modifier = Modifier
                     .weight(1f)
                     .height(200.dp)
-                    .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(12.dp))
-                    .padding(16.dp)
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
+                    .padding(12.dp)
             ) {
-                CandlestickChart(history)
+                CandlestickChart(
+                    history = history,
+                    currentPrice = currentPrice,
+                    maxPeriodPrice = maxPeriodPrice,
+                    minPeriodPrice = minPeriodPrice,
+                    accentColor = selectedCrypto.color
+                )
             }
             Column(
                 modifier = Modifier.width(110.dp),
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
                 Column {
-                    Text("Настроение", fontSize = 12.sp, color = Color.Gray)
+                    Text("Настроение", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(
-                        if (fearAndGreedValue == "—") "—" else "$fearAndGreedValue/100",
-                        fontWeight = FontWeight.Bold, fontSize = 16.sp
+                        text = if (fearAndGreedValue == "—") "—" else "$fearAndGreedValue/100",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.onBackground
                     )
                     if (fearAndGreedClass.isNotEmpty()) {
                         Text(
                             text = translatedFnGClass(fearAndGreedClass),
-                            fontSize = 11.sp, color = fngColor(fearAndGreedValue)
+                            fontSize = 11.sp,
+                            color = fngColor(fearAndGreedValue)
                         )
                     }
                 }
                 Column {
-                    Text("Капитализация", fontSize = 12.sp, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        text = "Капитализация",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                     if (marketCap != null) {
                         val isGrowing = marketCapChange >= 0
-                        val capColor = if (isGrowing) Color(0xFF4CAF50) else Color(0xFFF44336)
+                        val capColor = if (isGrowing) Color(0xFF66BB6A) else Color(0xFFEF5350)
                         Text(
                             text = formatMarketCap(marketCap),
-                            fontWeight = FontWeight.Bold, fontSize = 14.sp,
-                            color = capColor, maxLines = 1
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = capColor,
+                            maxLines = 1
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             val arrowStr = if (isGrowing) "▲" else "▼"
                             Text(arrowStr, color = capColor, fontSize = 12.sp)
                             Spacer(Modifier.width(2.dp))
-                            Text(String.format(Locale.US, "%.2f%%", abs(marketCapChange)), fontSize = 11.sp, color = capColor)
+                            Text(
+                                text = String.format(Locale.US, "%.2f%%", abs(marketCapChange)),
+                                fontSize = 11.sp,
+                                color = capColor
+                            )
                         }
                     } else {
-                        Text("—", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Text(
+                            text = "—",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
                     }
                 }
             }
+        }
+
+        if (lastUpdatedText != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = lastUpdatedText,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
 
 @Composable
-fun CandlestickChart(history: List<DailyPrice>) {
-    if (history.isEmpty()) return
+fun CandlestickChart(
+    history: List<DailyPrice>,
+    currentPrice: Double?,
+    maxPeriodPrice: Double?,
+    minPeriodPrice: Double?,
+    accentColor: Color
+) {
+    if (history.isEmpty() || maxPeriodPrice == null || minPeriodPrice == null) return
 
-    val minPrice = history.minOf { it.rawLow }
-    val maxPrice = history.maxOf { it.rawHigh }
-    val priceRange = if (maxPrice == minPrice) 1.0 else maxPrice - minPrice
-
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val candleWidth = size.width / history.size
-        val widthPadding = candleWidth * 0.2f
-        val actualCandleWidth = candleWidth - (widthPadding * 2)
-
-        history.forEachIndexed { index, dailyPrice ->
-            val color = if (dailyPrice.isBullish) Color(0xFF4CAF50) else Color(0xFFF44336)
-            val xCenter = (index * candleWidth) + (candleWidth / 2)
-
-            val yHigh = size.height - ((dailyPrice.rawHigh - minPrice) / priceRange * size.height).toFloat()
-            val yLow = size.height - ((dailyPrice.rawLow - minPrice) / priceRange * size.height).toFloat()
-            val yOpen = size.height - ((dailyPrice.rawOpen - minPrice) / priceRange * size.height).toFloat()
-            val yClose = size.height - ((dailyPrice.rawClose - minPrice) / priceRange * size.height).toFloat()
-
-            drawLine(
-                color = color,
-                start = Offset(xCenter, yHigh),
-                end = Offset(xCenter, yLow),
-                strokeWidth = 4f
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "$${formatPrice(maxPeriodPrice)}",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false
             )
-
-            val topY = minOf(yOpen, yClose)
-            val bottomY = maxOf(yOpen, yClose)
-
-            drawRect(
-                color = color,
-                topLeft = Offset(xCenter - (actualCandleWidth / 2), topY),
-                size = Size(actualCandleWidth, maxOf(bottomY - topY, 4f))
-            )
+            if (currentPrice != null) {
+                Text(
+                    text = "┄ $${formatPrice(currentPrice)}",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = accentColor,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
         }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Canvas(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
+            fun priceToY(price: Double): Float {
+                if (maxPeriodPrice == minPeriodPrice) return size.height / 2f
+                return size.height - ((price - minPeriodPrice) / (maxPeriodPrice - minPeriodPrice) * size.height).toFloat()
+            }
+
+            val candleWidth = size.width / history.size
+            val widthPadding = candleWidth * 0.2f
+            val actualCandleWidth = candleWidth - (widthPadding * 2)
+
+            history.forEachIndexed { index, dailyPrice ->
+                val color = if (dailyPrice.isBullish) Color(0xFF66BB6A) else Color(0xFFEF5350)
+                val xCenter = (index * candleWidth) + (candleWidth / 2)
+
+                val yHigh = priceToY(dailyPrice.rawHigh)
+                val yLow = priceToY(dailyPrice.rawLow)
+                val yOpen = priceToY(dailyPrice.rawOpen)
+                val yClose = priceToY(dailyPrice.rawClose)
+
+                drawLine(
+                    color = color,
+                    start = Offset(xCenter, yHigh),
+                    end = Offset(xCenter, yLow),
+                    strokeWidth = 3.5f
+                )
+
+                val topY = minOf(yOpen, yClose)
+                val bottomY = maxOf(yOpen, yClose)
+
+                drawRect(
+                    color = color,
+                    topLeft = Offset(xCenter - (actualCandleWidth / 2), topY),
+                    size = Size(actualCandleWidth, maxOf(bottomY - topY, 4f))
+                )
+            }
+
+            if (currentPrice != null) {
+                val yCurrent = priceToY(currentPrice)
+                drawLine(
+                    color = accentColor,
+                    start = Offset(0f, yCurrent),
+                    end = Offset(size.width, yCurrent),
+                    strokeWidth = 2.5f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                )
+                drawCircle(
+                    color = accentColor,
+                    radius = 4.5f,
+                    center = Offset(size.width - 4.5f, yCurrent)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = "$${formatPrice(minPeriodPrice)}",
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false
+        )
     }
 }
